@@ -314,8 +314,15 @@ async def list_retail_prices(
 
     Returns ``(items, resolved_snapshot)`` where *resolved_snapshot* is the
     effective ``job_datetime`` used for scoping (or ``None`` when empty).
+
+    When *updated_since* is provided without an explicit *snapshot_date*,
+    snapshot pinning is skipped so the query can return rows across
+    multiple ingestion runs (historical mode).
     """
-    resolved = await _resolve_retail_snapshot(snapshot_date)
+    if updated_since is not None and snapshot_date is None:
+        resolved = None
+    else:
+        resolved = await _resolve_retail_snapshot(snapshot_date)
 
     clauses: list[str] = []
     params: list[Any] = []
