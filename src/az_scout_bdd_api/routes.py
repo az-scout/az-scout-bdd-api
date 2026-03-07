@@ -868,6 +868,7 @@ async def v1_pricing_summary(
     snapshotSince: str | None = Query(  # noqa: N803
         None, description="ISO datetime — snapshot_utc >= value"
     ),
+    currency: str | None = Query(None, description="Currency code filter (e.g. USD)"),
     limit: int | None = Query(None, description="Page size (1-5000, default 1000)"),
     cursor: str | None = Query(None, description="Opaque pagination cursor"),
 ) -> JSONResponse:
@@ -897,6 +898,7 @@ async def v1_pricing_summary(
             categories=category,
             price_types=priceType,
             snapshot_since=ss,
+            currency=currency,
         )
     except Exception:
         logger.exception("v1/pricing/summary error")
@@ -921,6 +923,7 @@ async def v1_pricing_summary_latest(
     priceType: list[str] | None = Query(  # noqa: N803, B008
         None, description="Filter by price type(s): retail, spot"
     ),
+    currency: str | None = Query(None, description="Currency code filter (e.g. USD)"),
     limit: int | None = Query(None, description="Page size (1-5000, default 1000)"),
     cursor: str | None = Query(None, description="Opaque pagination cursor"),
 ) -> JSONResponse:
@@ -948,6 +951,7 @@ async def v1_pricing_summary_latest(
             regions=region,
             categories=category,
             price_types=priceType,
+            currency=currency,
         )
     except Exception:
         logger.exception("v1/pricing/summary/latest error")
@@ -972,6 +976,7 @@ async def v1_pricing_summary_series(
     bucket: str = Query(..., description="Time bucket: day|week|month"),
     metric: str = Query("median", description="Metric: avg|median|min|max|p10|p25|p75|p90"),
     category: str | None = Query(None, description="Category filter (omit for global)"),
+    currency: str | None = Query(None, description="Currency code filter (e.g. USD)"),
 ) -> JSONResponse:
     """Time-bucketed pricing metric aggregation over runs (v1, not paginated)."""
     from az_scout_bdd_api.db_api import pricing_summary_series
@@ -996,6 +1001,7 @@ async def v1_pricing_summary_series(
             bucket_val,
             metric=metric_val,
             category=category,
+            currency=currency,
         )
     except Exception:
         logger.exception("v1/pricing/summary/series error")
@@ -1011,6 +1017,7 @@ async def v1_pricing_summary_cheapest(
     priceType: str = Query("retail", description="Price type: retail|spot"),  # noqa: N803
     metric: str = Query("median", description="Metric to rank by (default median)"),
     category: str | None = Query(None, description="Category filter (omit for global)"),
+    currency: str | None = Query(None, description="Currency code filter (e.g. USD)"),
     limit: int | None = Query(None, description="Max results (default 10, max 100)"),
 ) -> JSONResponse:
     """Top N cheapest regions from the latest run, ranked by metric (v1)."""
@@ -1035,6 +1042,7 @@ async def v1_pricing_summary_cheapest(
             price_type=pt_val,
             metric=metric_val,
             category=category,
+            currency=currency,
         )
     except Exception:
         logger.exception("v1/pricing/summary/cheapest error")
@@ -1388,6 +1396,7 @@ async def v1_pricing_summary_compare(
         None, description="Price type: retail|spot"
     ),
     category: str | None = Query(None, description="Category filter"),
+    currency: str | None = Query(None, description="Currency code filter (e.g. USD)"),
 ) -> JSONResponse:
     """Compare pricing summary across regions from the latest run (v1)."""
     from az_scout_bdd_api.db_api import pricing_summary_compare
@@ -1402,7 +1411,12 @@ async def v1_pricing_summary_compare(
         return _error_response(400, "BAD_REQUEST", str(exc))
 
     try:
-        items = await pricing_summary_compare(regions, price_type=pt_val, category=category)
+        items = await pricing_summary_compare(
+            regions,
+            price_type=pt_val,
+            category=category,
+            currency=currency,
+        )
     except Exception:
         logger.exception("v1/pricing/summary/compare error")
         return _error_response(500, "INTERNAL", "Query failed")

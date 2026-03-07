@@ -119,11 +119,11 @@ Versioned OpenAPI spec: [`openapi/v1.yaml`](openapi/v1.yaml)
 | Method | Path | Parameters | Description |
 |---|---|---|---|
 | `GET` | `/v1/pricing/categories` | `limit?`, `cursor?` | Distinct pricing categories |
-| `GET` | `/v1/pricing/summary` | `region?[]`, `category?[]`, `priceType?[]`, `snapshotSince?`, `limit?`, `cursor?` | Pre-aggregated price summaries (multi-value filters) |
-| `GET` | `/v1/pricing/summary/latest` | `region?[]`, `category?[]`, `priceType?[]`, `limit?`, `cursor?` | Price summaries from latest run |
-| `GET` | `/v1/pricing/summary/series` | `region` *(req)*, `priceType` *(req)*, `bucket` *(req)*, `metric?`, `category?` | Time-bucketed pricing metric evolution |
-| `GET` | `/v1/pricing/summary/cheapest` | `priceType?`, `metric?`, `category?`, `limit?` | Top N cheapest regions from latest run |
-| `GET` | `/v1/pricing/summary/compare` | `regions[]` *(req)*, `priceType?`, `category?` | Compare pricing summaries across regions |
+| `GET` | `/v1/pricing/summary` | `region?[]`, `category?[]`, `priceType?[]`, `currency?`, `snapshotSince?`, `limit?`, `cursor?` | Pre-aggregated price summaries (multi-value filters) |
+| `GET` | `/v1/pricing/summary/latest` | `region?[]`, `category?[]`, `priceType?[]`, `currency?`, `limit?`, `cursor?` | Price summaries from latest run |
+| `GET` | `/v1/pricing/summary/series` | `region` *(req)*, `priceType` *(req)*, `bucket` *(req)*, `metric?`, `category?`, `currency?` | Time-bucketed pricing metric evolution |
+| `GET` | `/v1/pricing/summary/cheapest` | `priceType?`, `metric?`, `category?`, `currency?`, `limit?` | Top N cheapest regions from latest run |
+| `GET` | `/v1/pricing/summary/compare` | `regions[]` *(req)*, `priceType?`, `category?`, `currency?` | Compare pricing summaries across regions |
 
 ### V1 endpoints — SKU catalog
 

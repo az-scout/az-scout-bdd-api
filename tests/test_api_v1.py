@@ -552,3 +552,125 @@ class TestV1SavingsPlans:
         resp = client.get(f"{PREFIX}/retail/savings-plans")
         assert resp.status_code == 200
         assert "resolvedSnapshotDate" not in resp.json()["meta"]
+
+
+# ==================================================================
+# /v1/pricing/summary
+# ==================================================================
+
+_PRICE_SUMMARY_ROW = {
+    "id": 1,
+    "runId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    "snapshotUtc": "2026-03-01T00:00:00+00:00",
+    "region": "eastus",
+    "category": None,
+    "priceType": "retail",
+    "currencyCode": "EUR",
+    "avgPrice": 1.23,
+    "medianPrice": 1.10,
+    "minPrice": 0.05,
+    "maxPrice": 9.99,
+    "p10Price": 0.10,
+    "p25Price": 0.50,
+    "p75Price": 2.00,
+    "p90Price": 5.00,
+    "skuCount": 42,
+}
+
+
+class TestV1PricingSummary:
+    @patch("az_scout_bdd_api.db_api.list_pricing_summary", new_callable=AsyncMock)
+    def test_happy_path(self, mock_fn: AsyncMock, client: TestClient) -> None:
+        mock_fn.return_value = [_PRICE_SUMMARY_ROW]
+        resp = client.get(f"{PREFIX}/pricing/summary")
+        assert resp.status_code == 200
+        _assert_list_shape(resp.json())
+        assert len(resp.json()["items"]) == 1
+
+    @patch("az_scout_bdd_api.db_api.list_pricing_summary", new_callable=AsyncMock)
+    def test_currency_filter(self, mock_fn: AsyncMock, client: TestClient) -> None:
+        mock_fn.return_value = [_PRICE_SUMMARY_ROW]
+        resp = client.get(f"{PREFIX}/pricing/summary?currency=EUR")
+        assert resp.status_code == 200
+        mock_fn.assert_called_once()
+        assert mock_fn.call_args.kwargs["currency"] == "EUR"
+
+
+class TestV1PricingSummaryLatest:
+    @patch("az_scout_bdd_api.db_api.list_pricing_summary_latest", new_callable=AsyncMock)
+    def test_happy_path(self, mock_fn: AsyncMock, client: TestClient) -> None:
+        mock_fn.return_value = [_PRICE_SUMMARY_ROW]
+        resp = client.get(f"{PREFIX}/pricing/summary/latest")
+        assert resp.status_code == 200
+        _assert_list_shape(resp.json())
+
+    @patch("az_scout_bdd_api.db_api.list_pricing_summary_latest", new_callable=AsyncMock)
+    def test_currency_filter(self, mock_fn: AsyncMock, client: TestClient) -> None:
+        mock_fn.return_value = [_PRICE_SUMMARY_ROW]
+        resp = client.get(f"{PREFIX}/pricing/summary/latest?currency=EUR")
+        assert resp.status_code == 200
+        assert mock_fn.call_args.kwargs["currency"] == "EUR"
+
+
+class TestV1PricingSummarySeries:
+    @patch("az_scout_bdd_api.db_api.pricing_summary_series", new_callable=AsyncMock)
+    def test_happy_path(self, mock_fn: AsyncMock, client: TestClient) -> None:
+        mock_fn.return_value = [
+            {"bucketTs": "2026-03-01T00:00:00", "value": 1.5, "totalSkus": 10, "points": 3}
+        ]
+        resp = client.get(
+            f"{PREFIX}/pricing/summary/series?region=eastus&priceType=retail&bucket=day"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["items"]) == 1
+
+    @patch("az_scout_bdd_api.db_api.pricing_summary_series", new_callable=AsyncMock)
+    def test_currency_filter(self, mock_fn: AsyncMock, client: TestClient) -> None:
+        mock_fn.return_value = []
+        resp = client.get(
+            f"{PREFIX}/pricing/summary/series"
+            "?region=eastus&priceType=retail&bucket=day&currency=EUR"
+        )
+        assert resp.status_code == 200
+        assert mock_fn.call_args.kwargs["currency"] == "EUR"
+
+    def test_invalid_bucket(self, client: TestClient) -> None:
+        resp = client.get(
+            f"{PREFIX}/pricing/summary/series?region=eastus&priceType=retail&bucket=invalid"
+        )
+        assert resp.status_code == 400
+
+
+class TestV1PricingSummaryCheapest:
+    @patch("az_scout_bdd_api.db_api.list_pricing_cheapest", new_callable=AsyncMock)
+    def test_happy_path(self, mock_fn: AsyncMock, client: TestClient) -> None:
+        mock_fn.return_value = [_PRICE_SUMMARY_ROW]
+        resp = client.get(f"{PREFIX}/pricing/summary/cheapest")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["items"]) == 1
+
+    @patch("az_scout_bdd_api.db_api.list_pricing_cheapest", new_callable=AsyncMock)
+    def test_currency_filter(self, mock_fn: AsyncMock, client: TestClient) -> None:
+        mock_fn.return_value = [_PRICE_SUMMARY_ROW]
+        resp = client.get(f"{PREFIX}/pricing/summary/cheapest?currency=EUR")
+        assert resp.status_code == 200
+        assert mock_fn.call_args.kwargs["currency"] == "EUR"
+
+
+class TestV1PricingSummaryCompare:
+    @patch("az_scout_bdd_api.db_api.pricing_summary_compare", new_callable=AsyncMock)
+    def test_happy_path(self, mock_fn: AsyncMock, client: TestClient) -> None:
+        mock_fn.return_value = {"eastus": [_PRICE_SUMMARY_ROW]}
+        resp = client.get(f"{PREFIX}/pricing/summary/compare?regions=eastus&regions=westus")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["items"]["eastus"][0]["region"] == "eastus"
+
+    @patch("az_scout_bdd_api.db_api.pricing_summary_compare", new_callable=AsyncMock)
+    def test_currency_filter(self, mock_fn: AsyncMock, client: TestClient) -> None:
+        mock_fn.return_value = {}
+        resp = client.get(f"{PREFIX}/pricing/summary/compare?regions=eastus&currency=EUR")
+        assert resp.status_code == 200
+        assert mock_fn.call_args.kwargs["currency"] == "EUR"

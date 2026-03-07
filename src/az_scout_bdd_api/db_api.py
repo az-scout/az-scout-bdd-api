@@ -887,11 +887,15 @@ async def list_pricing_summary(
     categories: list[str] | None = None,
     price_types: list[str] | None = None,
     snapshot_since: datetime | None = None,
+    currency: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return price_summary rows with multi-value filters, keyset-paginated."""
     clauses: list[str] = []
     params: list[Any] = []
 
+    if currency:
+        clauses.append("currency_code = %s")
+        params.append(currency)
     if regions:
         clauses.append("region = ANY(%s::text[])")
         params.append(regions)
@@ -934,11 +938,15 @@ async def list_pricing_summary_latest(
     regions: list[str] | None = None,
     categories: list[str] | None = None,
     price_types: list[str] | None = None,
+    currency: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return price_summary rows from the most recent run_id only."""
     clauses = ["run_id = (SELECT run_id FROM price_summary ORDER BY snapshot_utc DESC LIMIT 1)"]
     params: list[Any] = []
 
+    if currency:
+        clauses.append("currency_code = %s")
+        params.append(currency)
     if regions:
         clauses.append("region = ANY(%s::text[])")
         params.append(regions)
@@ -990,10 +998,15 @@ async def pricing_summary_series(
     *,
     metric: str = "median_price",
     category: str | None = None,
+    currency: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return time-bucketed aggregation of a pricing metric over runs."""
     clauses = ["region = %s", "price_type = %s"]
     params: list[Any] = [region, price_type]
+
+    if currency:
+        clauses.append("currency_code = %s")
+        params.append(currency)
 
     if category is not None:
         clauses.append("COALESCE(category, '') = %s")
@@ -1038,6 +1051,7 @@ async def list_pricing_cheapest(
     price_type: str = "retail",
     metric: str = "median_price",
     category: str | None = None,
+    currency: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return the N cheapest regions from the latest run, ranked by *metric*."""
     clauses = [
@@ -1045,6 +1059,10 @@ async def list_pricing_cheapest(
         "price_type = %s",
     ]
     params: list[Any] = [price_type]
+
+    if currency:
+        clauses.append("currency_code = %s")
+        params.append(currency)
 
     if category is not None:
         clauses.append("COALESCE(category, '') = %s")
@@ -1598,6 +1616,7 @@ async def pricing_summary_compare(
     price_type: str | None = None,
     metric: str | None = None,
     category: str | None = None,
+    currency: str | None = None,
 ) -> dict[str, Any]:
     """Compare pricing summary across regions from the latest run.
 
@@ -1609,6 +1628,9 @@ async def pricing_summary_compare(
     ]
     params: list[Any] = [regions]
 
+    if currency:
+        clauses.append("currency_code = %s")
+        params.append(currency)
     if price_type:
         clauses.append("price_type = %s")
         params.append(price_type)
