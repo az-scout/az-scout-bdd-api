@@ -88,14 +88,12 @@ async def ensure_pool() -> psycopg_pool.AsyncConnectionPool:
             # checkout.  We pass ``kwargs`` as a callable (psycopg_pool ≥ 3.3)
             # so _get_token() is called each time, transparently refreshing
             # the token when it nears expiry.
-            pool: psycopg_pool.AsyncConnectionPool = (
-                psycopg_pool.AsyncNullConnectionPool(
-                    conninfo=conninfo,
-                    max_size=5,
-                    open=False,
-                    kwargs=lambda: {"password": _get_token(cfg)},
-                    reconnect_timeout=30,
-                )
+            pool: psycopg_pool.AsyncConnectionPool = psycopg_pool.AsyncNullConnectionPool(
+                conninfo=conninfo,
+                max_size=5,
+                open=False,
+                kwargs=lambda: {"password": _get_token(cfg)},
+                reconnect_timeout=30,
             )
             logger.info("DB NullPool configured with Managed Identity auth (token auto-refresh)")
         else:
