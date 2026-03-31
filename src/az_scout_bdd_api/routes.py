@@ -128,27 +128,15 @@ async def status() -> dict[str, Any]:
                 cur = await conn.execute("SELECT COUNT(*) FROM retail_prices_vm")
                 row = await cur.fetchone()
                 count = row[0] if row else 0
-        except Exception:
-            count = -1
 
-        try:
-            async with get_conn() as conn:
                 cur = await conn.execute("SELECT COUNT(*) FROM spot_eviction_rates")
                 row = await cur.fetchone()
                 eviction_count = row[0] if row else 0
-        except Exception:
-            eviction_count = -1
 
-        try:
-            async with get_conn() as conn:
                 cur = await conn.execute("SELECT COUNT(*) FROM spot_price_history")
                 row = await cur.fetchone()
                 price_count = row[0] if row else 0
-        except Exception:
-            price_count = -1
 
-        try:
-            async with get_conn() as conn:
                 cur = await conn.execute(
                     "SELECT COUNT(DISTINCT region), COUNT(DISTINCT sku_name) "
                     "FROM spot_eviction_rates "

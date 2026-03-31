@@ -7,11 +7,39 @@ placeholders — no string interpolation of user data.
 
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime
 from typing import Any
 
 from az_scout_bdd_api.db import get_conn, is_healthy
 from az_scout_bdd_api.pagination import keyset_clause
+
+
+# ------------------------------------------------------------------
+# Lightweight TTL cache for slow, rarely-changing queries
+# ------------------------------------------------------------------
+
+_cache: dict[str, tuple[float, Any]] = {}  # key → (expires_at, value)
+
+_TTL_SNAPSHOT = 60  # snapshot resolution: 60s
+_TTL_STATUS = 30  # status / stats: 30s
+
+
+def _cache_get(key: str) -> Any | None:
+    """Return cached value if still valid, else None."""
+    entry = _cache.get(key)
+    if entry is None:
+        return None
+    expires_at, value = entry
+    if time.monotonic() > expires_at:
+        del _cache[key]
+        return None
+    return value
+
+
+def _cache_set(key: str, value: Any, ttl: float) -> None:
+    _cache[key] = (time.monotonic() + ttl, value)
+
 
 # ------------------------------------------------------------------
 # Snapshot resolution helpers
@@ -26,8 +54,14 @@ async def _resolve_retail_snapshot(
     - ``None`` → latest ``job_datetime`` in the table.
     - With date → latest ``job_datetime <= target_date``.
 
+    Results are cached for 60s to avoid repeated MAX() queries.
     Returns ``None`` when the table is empty or no snapshot matches.
     """
+    cache_key = f"retail_snap:{target_date}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached  # type: ignore[no-any-return]
+
     if target_date is None:
         sql = "SELECT MAX(job_datetime) FROM retail_prices_vm"
         params: list[Any] = []
@@ -38,7 +72,10 @@ async def _resolve_retail_snapshot(
     async with get_conn() as conn:
         cur = await conn.execute(sql, params)
         row = await cur.fetchone()
-    return row[0] if row and row[0] else None
+    result = row[0] if row and row[0] else None
+    if result is not None:
+        _cache_set(cache_key, result, _TTL_SNAPSHOT)
+    return result
 
 
 async def _resolve_spot_snapshot(
@@ -49,8 +86,14 @@ async def _resolve_spot_snapshot(
     - ``None`` → latest ``job_datetime`` in the table.
     - With date → latest ``job_datetime <= target_date``.
 
+    Results are cached for 60s to avoid repeated MAX() queries.
     Returns ``None`` when the table is empty or no snapshot matches.
     """
+    cache_key = f"spot_snap:{target_date}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached  # type: ignore[no-any-return]
+
     if target_date is None:
         sql = "SELECT MAX(job_datetime) FROM spot_eviction_rates"
         params: list[Any] = []
@@ -61,7 +104,10 @@ async def _resolve_spot_snapshot(
     async with get_conn() as conn:
         cur = await conn.execute(sql, params)
         row = await cur.fetchone()
-    return row[0] if row and row[0] else None
+    result = row[0] if row and row[0] else None
+    if result is not None:
+        _cache_set(cache_key, result, _TTL_SNAPSHOT)
+    return result
 
 
 # ------------------------------------------------------------------
@@ -70,7 +116,15 @@ async def _resolve_spot_snapshot(
 
 
 async def get_status() -> dict[str, Any]:
-    """Gather database health and per-table statistics."""
+    """Gather database health and per-table statistics.
+
+    Uses a single connection and combines counts + freshness into one
+    round-trip per table to minimise pool checkouts.  Cached for 30s.
+    """
+    cached = _cache_get("status")
+    if cached is not None:
+        return cached  # type: ignore[no-any-return]
+
     db_ok = await is_healthy()
     datasets: dict[str, Any] = {
         "retail": {"rowCount": 0, "lastJobDatetimeUtc": None, "lastJobId": None},
@@ -87,19 +141,18 @@ async def get_status() -> dict[str, Any]:
         ("evictionRates", "spot_eviction_rates"),
     ]
 
-    for key, table in table_map:
-        try:
-            async with get_conn() as conn:
-                cur = await conn.execute(f"SELECT COUNT(*) FROM {table}")  # noqa: S608
-                row = await cur.fetchone()
-                datasets[key]["rowCount"] = row[0] if row else 0
-
+    try:
+        async with get_conn() as conn:
+            for key, table in table_map:
+                # Single query: count + max datetime + latest job_id
                 cur = await conn.execute(
-                    f"SELECT MAX(job_datetime) FROM {table}"  # noqa: S608
+                    f"SELECT COUNT(*), MAX(job_datetime) FROM {table}"  # noqa: S608
                 )
                 row = await cur.fetchone()
-                if row and row[0] is not None:
-                    datasets[key]["lastJobDatetimeUtc"] = row[0].isoformat()
+                if row:
+                    datasets[key]["rowCount"] = row[0] or 0
+                    if row[1] is not None:
+                        datasets[key]["lastJobDatetimeUtc"] = row[1].isoformat()
 
                 cur = await conn.execute(
                     f"SELECT job_id FROM {table} "  # noqa: S608
@@ -109,10 +162,13 @@ async def get_status() -> dict[str, Any]:
                 row = await cur.fetchone()
                 if row and row[0] is not None:
                     datasets[key]["lastJobId"] = str(row[0])
-        except Exception:
+    except Exception:
+        for key in datasets:
             datasets[key]["rowCount"] = -1
 
-    return {"dbConnected": True, "datasets": datasets}
+    result = {"dbConnected": True, "datasets": datasets}
+    _cache_set("status", result, _TTL_STATUS)
+    return result
 
 
 # ------------------------------------------------------------------
@@ -1444,74 +1500,73 @@ async def spot_detail(
     """Combine spot price, eviction rate, and SKU catalog data.
 
     Returns ``(data, resolved_snapshot)`` with raw data from all three
-    sources for a specific SKU/region.
+    sources for a specific SKU/region.  Uses a single connection for
+    all three queries.
     """
     resolved = await _resolve_spot_snapshot(snapshot_date)
 
     result: dict[str, Any] = {"region": region, "sku": sku}
 
-    # 1. Spot price history (latest record)
-    spot_clauses = ["region = %s", "sku_name = %s"]
-    spot_params: list[Any] = [region, sku]
-    if os_type:
-        spot_clauses.append("os_type = %s")
-        spot_params.append(os_type)
-
-    spot_sql = (
-        "SELECT sku_name, os_type, region, price_history, job_id, job_datetime"
-        " FROM spot_price_history"
-        f" WHERE {' AND '.join(spot_clauses)}"
-        " LIMIT 1"
-    )
     async with get_conn() as conn:
+        # 1. Spot price history (latest record)
+        spot_clauses = ["region = %s", "sku_name = %s"]
+        spot_params: list[Any] = [region, sku]
+        if os_type:
+            spot_clauses.append("os_type = %s")
+            spot_params.append(os_type)
+
+        spot_sql = (
+            "SELECT sku_name, os_type, region, price_history, job_id, job_datetime"
+            " FROM spot_price_history"
+            f" WHERE {' AND '.join(spot_clauses)}"
+            " LIMIT 1"
+        )
         cur = await conn.execute(spot_sql, spot_params)
         row = await cur.fetchone()
-    if row:
-        result["spotPrice"] = {
-            "skuName": row[0],
-            "osType": row[1],
-            "region": row[2],
-            "priceHistory": row[3],
-            "jobId": row[4],
-            "jobDatetime": row[5].isoformat() if row[5] else None,
-        }
-    else:
-        result["spotPrice"] = None
+        if row:
+            result["spotPrice"] = {
+                "skuName": row[0],
+                "osType": row[1],
+                "region": row[2],
+                "priceHistory": row[3],
+                "jobId": row[4],
+                "jobDatetime": row[5].isoformat() if row[5] else None,
+            }
+        else:
+            result["spotPrice"] = None
 
-    # 2. Eviction rate (scoped to resolved snapshot)
-    eviction_clauses = ["region = %s", "sku_name = %s"]
-    eviction_params: list[Any] = [region, sku]
-    if resolved is not None:
-        eviction_clauses.append("job_datetime = %s")
-        eviction_params.append(resolved)
+        # 2. Eviction rate (scoped to resolved snapshot)
+        eviction_clauses = ["region = %s", "sku_name = %s"]
+        eviction_params: list[Any] = [region, sku]
+        if resolved is not None:
+            eviction_clauses.append("job_datetime = %s")
+            eviction_params.append(resolved)
 
-    eviction_sql = (
-        "SELECT sku_name, region, eviction_rate, job_id, job_datetime"
-        " FROM spot_eviction_rates"
-        f" WHERE {' AND '.join(eviction_clauses)}"
-        " ORDER BY job_datetime DESC NULLS LAST"
-        " LIMIT 1"
-    )
-    async with get_conn() as conn:
+        eviction_sql = (
+            "SELECT sku_name, region, eviction_rate, job_id, job_datetime"
+            " FROM spot_eviction_rates"
+            f" WHERE {' AND '.join(eviction_clauses)}"
+            " ORDER BY job_datetime DESC NULLS LAST"
+            " LIMIT 1"
+        )
         cur = await conn.execute(eviction_sql, eviction_params)
         row = await cur.fetchone()
-    if row:
-        result["evictionRate"] = {
-            "skuName": row[0],
-            "region": row[1],
-            "evictionRate": row[2],
-            "jobId": row[3],
-            "jobDatetime": row[4].isoformat() if row[4] else None,
-        }
-    else:
-        result["evictionRate"] = None
+        if row:
+            result["evictionRate"] = {
+                "skuName": row[0],
+                "region": row[1],
+                "evictionRate": row[2],
+                "jobId": row[3],
+                "jobDatetime": row[4].isoformat() if row[4] else None,
+            }
+        else:
+            result["evictionRate"] = None
 
-    # 3. SKU catalog enrichment
-    catalog_sql = f"SELECT {_SKU_COLS} FROM vm_sku_catalog WHERE sku_name = %s"
-    async with get_conn() as conn:
+        # 3. SKU catalog enrichment
+        catalog_sql = f"SELECT {_SKU_COLS} FROM vm_sku_catalog WHERE sku_name = %s"
         cur = await conn.execute(catalog_sql, [sku])
         row = await cur.fetchone()
-    result["catalog"] = _sku_row_to_dict(row) if row else None
+        result["catalog"] = _sku_row_to_dict(row) if row else None
 
     return result, resolved
 
@@ -1660,7 +1715,11 @@ async def pricing_summary_compare(
 
 
 async def get_global_stats() -> dict[str, Any]:
-    """Gather global dashboard metrics across all tables."""
+    """Gather global dashboard metrics across all tables.  Cached for 30s."""
+    cached = _cache_get("global_stats")
+    if cached is not None:
+        return cached  # type: ignore[no-any-return]
+
     stats: dict[str, Any] = {}
 
     async with get_conn() as conn:
@@ -1721,4 +1780,5 @@ async def get_global_stats() -> dict[str, Any]:
             freshness[key] = row[0].isoformat() if row and row[0] else None
         stats["dataFreshness"] = freshness
 
+    _cache_set("global_stats", stats, _TTL_STATUS)
     return stats

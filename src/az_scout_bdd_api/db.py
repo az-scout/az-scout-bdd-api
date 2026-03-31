@@ -63,50 +63,62 @@ def _get_token(cfg: DatabaseConfig) -> str:
     return _cached_token
 
 
+def _check_conn(conn: psycopg.AsyncConnection[Any]) -> None:
+    """Discard broken connections before handing them to callers.
+
+    Called by the pool on checkout.  If the underlying socket is closed
+    or the connection is in an error state, raise to force the pool to
+    open a fresh one instead.
+    """
+    if conn.broken:
+        raise psycopg.OperationalError("connection is broken")
+    if conn.closed:
+        raise psycopg.OperationalError("connection is closed")
+
+
 async def ensure_pool() -> psycopg_pool.AsyncConnectionPool:
     global _pool
-    if _pool is None:
-        cfg = get_config().database
-        logger.debug(
-            "DSN (redacted password): host=%s port=%s db=%s user=%s ssl=%s auth=%s",
-            cfg.host,
-            cfg.port,
-            cfg.dbname,
-            cfg.user,
-            cfg.sslmode,
-            cfg.auth_method,
+    if _pool is not None:
+        return _pool
+
+    cfg = get_config().database
+    logger.debug(
+        "DSN (redacted password): host=%s port=%s db=%s user=%s ssl=%s auth=%s",
+        cfg.host,
+        cfg.port,
+        cfg.dbname,
+        cfg.user,
+        cfg.sslmode,
+        cfg.auth_method,
+    )
+
+    conninfo = cfg.dsn
+
+    if cfg.auth_method == "msi":
+        # NullConnectionPool opens a fresh connection per checkout,
+        # so the check callback is less critical but still useful.
+        pool: psycopg_pool.AsyncConnectionPool = psycopg_pool.AsyncNullConnectionPool(
+            conninfo=conninfo,
+            max_size=5,
+            open=False,
+            kwargs=lambda: {"password": _get_token(cfg)},
+            reconnect_timeout=30,
+            check=_check_conn,
         )
+        logger.info("DB NullPool configured with Managed Identity auth (token auto-refresh)")
+    else:
+        pool = psycopg_pool.AsyncConnectionPool(
+            conninfo=conninfo,
+            min_size=1,
+            max_size=5,
+            open=False,
+            reconnect_timeout=30,
+            check=_check_conn,
+        )
+        logger.info("DB pool configured with password auth")
 
-        conninfo = cfg.dsn
-
-        if cfg.auth_method == "msi":
-            # With MSI the "password" is a short-lived Entra ID token (~1 h).
-            # A regular pool freezes kwargs at creation, so the token would
-            # expire and break all new connections.
-            #
-            # AsyncNullConnectionPool creates a fresh connection for every
-            # checkout.  We pass ``kwargs`` as a callable (psycopg_pool ≥ 3.3)
-            # so _get_token() is called each time, transparently refreshing
-            # the token when it nears expiry.
-            pool: psycopg_pool.AsyncConnectionPool = psycopg_pool.AsyncNullConnectionPool(
-                conninfo=conninfo,
-                max_size=5,
-                open=False,
-                kwargs=lambda: {"password": _get_token(cfg)},
-                reconnect_timeout=30,
-            )
-            logger.info("DB NullPool configured with Managed Identity auth (token auto-refresh)")
-        else:
-            pool = psycopg_pool.AsyncConnectionPool(
-                conninfo=conninfo,
-                min_size=1,
-                max_size=5,
-                open=False,
-            )
-            logger.info("DB pool configured with password auth")
-
-        await pool.open()
-        _pool = pool
+    await pool.open()
+    _pool = pool
     return _pool
 
 
