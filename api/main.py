@@ -125,6 +125,7 @@ async def root() -> JSONResponse:
             "apiVersion": API_VERSION,
             "endpoints": {
                 "health": "/health",
+                "ready": "/ready",
                 "legacy": ["/status", "/spot/eviction-rates", "/spot/price-history"],
                 "v1": "/v1/...",
                 "docs": "/docs",
@@ -135,7 +136,16 @@ async def root() -> JSONResponse:
 
 @app.get("/health", tags=["infra"])
 async def health() -> JSONResponse:
-    """Liveness / readiness probe."""
+    """Liveness probe — always responds immediately, never blocks on DB."""
+    return JSONResponse(
+        status_code=200,
+        content={"status": "alive"},
+    )
+
+
+@app.get("/ready", tags=["infra"])
+async def ready() -> JSONResponse:
+    """Readiness probe — checks DB connectivity."""
     healthy = await is_healthy()
     status = 200 if healthy else 503
     return JSONResponse(

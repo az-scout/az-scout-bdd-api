@@ -63,7 +63,7 @@ def _get_token(cfg: DatabaseConfig) -> str:
     return _cached_token
 
 
-def _check_conn(conn: psycopg.AsyncConnection[Any]) -> None:
+async def _check_conn(conn: psycopg.AsyncConnection[Any]) -> None:
     """Discard broken connections before handing them to callers.
 
     Called by the pool on checkout.  If the underlying socket is closed
