@@ -14,15 +14,16 @@ from typing import Any
 from az_scout_bdd_api.db import get_conn, is_healthy
 from az_scout_bdd_api.pagination import keyset_clause
 
-
 # ------------------------------------------------------------------
 # Lightweight TTL cache for slow, rarely-changing queries
 # ------------------------------------------------------------------
 
 _cache: dict[str, tuple[float, Any]] = {}  # key → (expires_at, value)
 
-_TTL_SNAPSHOT = 60  # snapshot resolution: 60s
-_TTL_STATUS = 30  # status / stats: 30s
+_TTL_SNAPSHOT = 300  # snapshot resolution: 5 min
+_TTL_STATUS = 120  # status / stats: 2 min
+_TTL_LOCATIONS = 300  # locations / skus: 5 min
+_TTL_SPOT_SERIES = 120  # spot price series: 2 min
 
 
 def _cache_get(key: str) -> Any | None:
@@ -118,8 +119,8 @@ async def _resolve_spot_snapshot(
 async def get_status() -> dict[str, Any]:
     """Gather database health and per-table statistics.
 
-    Uses a single connection and combines counts + freshness into one
-    round-trip per table to minimise pool checkouts.  Cached for 30s.
+    Uses ``pg_catalog`` for fast estimated row counts and ``job_runs``
+    for freshness instead of scanning large data tables.  Cached for 2 min.
     """
     cached = _cache_get("status")
     if cached is not None:
@@ -141,27 +142,55 @@ async def get_status() -> dict[str, Any]:
         ("evictionRates", "spot_eviction_rates"),
     ]
 
+    # Dataset name in job_runs → datasets key
+    job_dataset_map: dict[str, str] = {
+        "azure_pricing": "retail",
+        "azure_spot": "spotPrices",
+        "azure_spot_eviction": "evictionRates",
+    }
+
     try:
         async with get_conn() as conn:
-            for key, table in table_map:
-                # Single query: count + max datetime + latest job_id
+            # Estimated row counts via pg_catalog (instant, no seq scan)
+            try:
                 cur = await conn.execute(
-                    f"SELECT COUNT(*), MAX(job_datetime) FROM {table}"  # noqa: S608
+                    "SELECT c.relname, c.reltuples::bigint"
+                    " FROM pg_catalog.pg_class c"
+                    " JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
+                    " WHERE n.nspname = 'public'"
+                    "   AND c.relname = ANY(%s)",
+                    [[t[1] for t in table_map]],
                 )
-                row = await cur.fetchone()
-                if row:
-                    datasets[key]["rowCount"] = row[0] or 0
-                    if row[1] is not None:
-                        datasets[key]["lastJobDatetimeUtc"] = row[1].isoformat()
+                count_rows = await cur.fetchall()
+                for r in count_rows:
+                    tbl_name = r[0]
+                    count_val = max(0, r[1])
+                    for key, tbl in table_map:
+                        if tbl == tbl_name:
+                            datasets[key]["rowCount"] = count_val
+            except Exception:
+                pass
 
+            # Freshness from job_runs (small table, always fast)
+            try:
                 cur = await conn.execute(
-                    f"SELECT job_id FROM {table} "  # noqa: S608
-                    "ORDER BY job_datetime DESC NULLS LAST, job_id DESC "
-                    "LIMIT 1"
+                    "SELECT dataset, MAX(started_at_utc), "
+                    "  (SELECT run_id FROM job_runs jr2"
+                    "   WHERE jr2.dataset = jr.dataset"
+                    "   ORDER BY started_at_utc DESC LIMIT 1)"
+                    " FROM job_runs jr"
+                    " GROUP BY dataset"
                 )
-                row = await cur.fetchone()
-                if row and row[0] is not None:
-                    datasets[key]["lastJobId"] = str(row[0])
+                rows = await cur.fetchall()
+                for r in rows:
+                    ds_key = job_dataset_map.get(r[0])
+                    if ds_key and ds_key in datasets:
+                        datasets[ds_key]["lastJobDatetimeUtc"] = (
+                            r[1].isoformat() if r[1] else None
+                        )
+                        datasets[ds_key]["lastJobId"] = str(r[2]) if r[2] else None
+            except Exception:
+                pass
     except Exception:
         for key in datasets:
             datasets[key]["rowCount"] = -1
@@ -180,7 +209,16 @@ async def list_locations(
     limit: int,
     cursor_payload: dict[str, Any] | None,
 ) -> list[dict[str, str]]:
-    """Return distinct location names from all tables, keyset-paginated."""
+    """Return distinct location names from all tables, keyset-paginated.
+
+    Results are cached for 5 min when not paginating (first page).
+    """
+    if cursor_payload is None:
+        cache_key = f"locations:{limit}"
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
     clauses: list[str] = []
     params: list[Any] = []
 
@@ -193,7 +231,7 @@ async def list_locations(
 
     sql = (
         "SELECT name FROM ("
-        "  SELECT DISTINCT arm_region_name AS name FROM retail_prices_vm"
+        "  SELECT DISTINCT region AS name FROM price_summary"
         "  UNION"
         "  SELECT DISTINCT region AS name FROM spot_eviction_rates"
         "  UNION"
@@ -205,7 +243,11 @@ async def list_locations(
     async with get_conn() as conn:
         cur = await conn.execute(sql, params)
         rows = await cur.fetchall()
-    return [{"name": r[0]} for r in rows]
+    result = [{"name": r[0]} for r in rows]
+
+    if cursor_payload is None:
+        _cache_set(f"locations:{limit}", result, _TTL_LOCATIONS)
+    return result
 
 
 # ------------------------------------------------------------------
@@ -218,7 +260,16 @@ async def list_skus(
     cursor_payload: dict[str, Any] | None,
     search: str | None = None,
 ) -> list[dict[str, str]]:
-    """Return distinct SKU names, optionally filtered by substring."""
+    """Return distinct SKU names, optionally filtered by substring.
+
+    Results are cached for 5 min when not paginating and not searching.
+    """
+    if cursor_payload is None and not search:
+        cache_key = f"skus:{limit}"
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
     inner_clauses: list[str] = []
     inner_params: list[Any] = []
 
@@ -246,8 +297,7 @@ async def list_skus(
 
     sql = (
         'SELECT "skuName" FROM ('
-        '  SELECT DISTINCT arm_sku_name AS "skuName" FROM retail_prices_vm'
-        "    WHERE arm_sku_name IS NOT NULL"
+        '  SELECT DISTINCT sku_name AS "skuName" FROM vm_sku_catalog'
         "  UNION"
         '  SELECT DISTINCT sku_name AS "skuName" FROM spot_eviction_rates'
         "  UNION"
@@ -259,7 +309,11 @@ async def list_skus(
     async with get_conn() as conn:
         cur = await conn.execute(sql, all_outer_params)
         rows = await cur.fetchall()
-    return [{"skuName": r[0]} for r in rows]
+    result = [{"skuName": r[0]} for r in rows]
+
+    if cursor_payload is None and not search:
+        _cache_set(f"skus:{limit}", result, _TTL_LOCATIONS)
+    return result
 
 
 # ------------------------------------------------------------------
@@ -271,7 +325,16 @@ async def list_currencies(
     limit: int,
     cursor_payload: dict[str, Any] | None,
 ) -> list[dict[str, str]]:
-    """Return distinct currency codes from retail_prices_vm."""
+    """Return distinct currency codes from retail_prices_vm.
+
+    Cached for 5 min when not paginating (first page).
+    """
+    if cursor_payload is None:
+        cache_key = f"currencies:{limit}"
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
     clauses: list[str] = []
     params: list[Any] = []
 
@@ -283,7 +346,7 @@ async def list_currencies(
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
 
     sql = (
-        "SELECT DISTINCT currency_code FROM retail_prices_vm"
+        "SELECT DISTINCT currency_code FROM price_summary"
         f"{where} ORDER BY currency_code ASC LIMIT %s"
     )
     params.append(limit + 1)
@@ -291,7 +354,11 @@ async def list_currencies(
     async with get_conn() as conn:
         cur = await conn.execute(sql, params)
         rows = await cur.fetchall()
-    return [{"currencyCode": r[0]} for r in rows]
+    result = [{"currencyCode": r[0]} for r in rows]
+
+    if cursor_payload is None:
+        _cache_set(f"currencies:{limit}", result, _TTL_LOCATIONS)
+    return result
 
 
 # ------------------------------------------------------------------
@@ -303,7 +370,16 @@ async def list_os_types(
     limit: int,
     cursor_payload: dict[str, Any] | None,
 ) -> list[dict[str, str]]:
-    """Return distinct OS types from spot_price_history."""
+    """Return distinct OS types from spot_price_history.
+
+    Cached for 5 min when not paginating (first page).
+    """
+    if cursor_payload is None:
+        cache_key = f"os_types:{limit}"
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
     clauses: list[str] = []
     params: list[Any] = []
 
@@ -320,7 +396,11 @@ async def list_os_types(
     async with get_conn() as conn:
         cur = await conn.execute(sql, params)
         rows = await cur.fetchall()
-    return [{"osType": r[0]} for r in rows]
+    result = [{"osType": r[0]} for r in rows]
+
+    if cursor_payload is None:
+        _cache_set(f"os_types:{limit}", result, _TTL_LOCATIONS)
+    return result
 
 
 # ------------------------------------------------------------------
@@ -896,6 +976,28 @@ def _pricing_cursor_to_sql(payload: dict[str, Any]) -> tuple[str, list[Any]]:
 
 
 # ------------------------------------------------------------------
+# Latest run_id resolution (shared by summary/latest, cheapest, compare)
+# ------------------------------------------------------------------
+
+
+async def _resolve_latest_run_id() -> str | None:
+    """Resolve the latest run_id from price_summary.  Cached for 2 min."""
+    cached = _cache_get("latest_run_id")
+    if cached is not None:
+        return cached  # type: ignore[no-any-return]
+
+    async with get_conn() as conn:
+        cur = await conn.execute(
+            "SELECT run_id FROM price_summary ORDER BY snapshot_utc DESC LIMIT 1"
+        )
+        row = await cur.fetchone()
+    result = str(row[0]) if row else None
+    if result is not None:
+        _cache_set("latest_run_id", result, _TTL_STATUS)
+    return result
+
+
+# ------------------------------------------------------------------
 # /v1/pricing/categories
 # ------------------------------------------------------------------
 
@@ -997,8 +1099,12 @@ async def list_pricing_summary_latest(
     currency: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return price_summary rows from the most recent run_id only."""
-    clauses = ["run_id = (SELECT run_id FROM price_summary ORDER BY snapshot_utc DESC LIMIT 1)"]
-    params: list[Any] = []
+    latest_run = await _resolve_latest_run_id()
+    if latest_run is None:
+        return []
+
+    clauses = ["run_id = %s"]
+    params: list[Any] = [latest_run]
 
     if currency:
         clauses.append("currency_code = %s")
@@ -1110,11 +1216,15 @@ async def list_pricing_cheapest(
     currency: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return the N cheapest regions from the latest run, ranked by *metric*."""
+    latest_run = await _resolve_latest_run_id()
+    if latest_run is None:
+        return []
+
     clauses = [
-        "run_id = (SELECT run_id FROM price_summary ORDER BY snapshot_utc DESC LIMIT 1)",
+        "run_id = %s",
         "price_type = %s",
     ]
-    params: list[Any] = [price_type]
+    params: list[Any] = [latest_run, price_type]
 
     if currency:
         clauses.append("currency_code = %s")
@@ -1381,8 +1491,14 @@ async def spot_price_series(
 ) -> list[dict[str, Any]]:
     """Denormalise JSONB price_history and aggregate by time bucket.
 
-    Returns time-bucketed average spot price series.
+    Returns time-bucketed average spot price series.  Cached for 2 min
+    because the JSONB explosion is expensive.
     """
+    cache_key = f"spot_series:{region}:{sku}:{bucket}:{os_type}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached  # type: ignore[no-any-return]
+
     clauses = ["region = %s", "sku_name = %s"]
     params: list[Any] = [region, sku]
 
@@ -1408,7 +1524,7 @@ async def spot_price_series(
     async with get_conn() as conn:
         cur = await conn.execute(sql, params)
         rows = await cur.fetchall()
-    return [
+    result = [
         {
             "bucketTs": r[0].isoformat() if r[0] else None,
             "avgPrice": float(r[1]) if r[1] is not None else None,
@@ -1418,6 +1534,8 @@ async def spot_price_series(
         }
         for r in rows
     ]
+    _cache_set(cache_key, result, _TTL_SPOT_SERIES)
+    return result
 
 
 # ==================================================================
@@ -1461,6 +1579,7 @@ async def retail_prices_compare(
         "  unit_of_measure, effective_start_date"
         f" FROM retail_prices_vm{where}"
         " ORDER BY arm_region_name ASC, retail_price ASC"
+        " LIMIT 5000"
     )
 
     async with get_conn() as conn:
@@ -1677,11 +1796,15 @@ async def pricing_summary_compare(
 
     Returns a dict keyed by region with aggregated pricing stats.
     """
+    latest_run = await _resolve_latest_run_id()
+    if latest_run is None:
+        return {}
+
     clauses = [
-        "run_id = (SELECT run_id FROM price_summary ORDER BY snapshot_utc DESC LIMIT 1)",
+        "run_id = %s",
         "region = ANY(%s::text[])",
     ]
-    params: list[Any] = [regions]
+    params: list[Any] = [latest_run, regions]
 
     if currency:
         clauses.append("currency_code = %s")
@@ -1715,7 +1838,11 @@ async def pricing_summary_compare(
 
 
 async def get_global_stats() -> dict[str, Any]:
-    """Gather global dashboard metrics across all tables.  Cached for 30s."""
+    """Gather global dashboard metrics across all tables.
+
+    Uses ``pg_class.reltuples`` for fast estimated counts instead of
+    expensive ``COUNT(*)`` full-table scans.  Cached for 30s.
+    """
     cached = _cache_get("global_stats")
     if cached is not None:
         return cached  # type: ignore[no-any-return]
@@ -1723,8 +1850,8 @@ async def get_global_stats() -> dict[str, Any]:
     stats: dict[str, Any] = {}
 
     async with get_conn() as conn:
-        # Row counts
-        tables = [
+        # Try fast estimated row counts via pg_class first
+        table_keys = [
             ("retailPrices", "retail_prices_vm"),
             ("spotPrices", "spot_price_history"),
             ("evictionRates", "spot_eviction_rates"),
@@ -1733,22 +1860,48 @@ async def get_global_stats() -> dict[str, Any]:
             ("jobRuns", "job_runs"),
             ("jobLogs", "job_logs"),
         ]
-        counts: dict[str, int] = {}
-        for key, table in tables:
-            cur = await conn.execute(f"SELECT COUNT(*) FROM {table}")  # noqa: S608
-            row = await cur.fetchone()
-            counts[key] = row[0] if row else 0
-        stats["rowCounts"] = counts
+        table_names = [t[1] for t in table_keys]
+        count_map: dict[str, int] = {}
+        try:
+            cur = await conn.execute(
+                "SELECT c.relname, c.reltuples::bigint"
+                " FROM pg_catalog.pg_class c"
+                " JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
+                " WHERE n.nspname = 'public'"
+                "   AND c.relname = ANY(%s)",
+                [table_names],
+            )
+            count_rows = await cur.fetchall()
+            count_map = {r[0]: max(0, r[1]) for r in count_rows}
+        except Exception:
+            pass  # counts stay at 0
+        stats["rowCounts"] = {key: count_map.get(tbl, 0) for key, tbl in table_keys}
 
         # Distinct regions
-        cur = await conn.execute("SELECT COUNT(DISTINCT arm_region_name) FROM retail_prices_vm")
-        row = await cur.fetchone()
-        stats["distinctRegions"] = row[0] if row else 0
+        try:
+            cur = await conn.execute(
+                "SELECT n_distinct FROM pg_catalog.pg_stats"
+                " WHERE tablename = 'retail_prices_vm'"
+                "   AND attname = 'arm_region_name'"
+            )
+            row = await cur.fetchone()
+            if row and row[0] is not None:
+                val = row[0]
+                if val > 0:
+                    stats["distinctRegions"] = int(val)
+                elif val < 0:
+                    stats["distinctRegions"] = int(
+                        abs(val) * count_map.get("retail_prices_vm", 0)
+                    )
+                else:
+                    stats["distinctRegions"] = 0
+            else:
+                stats["distinctRegions"] = 0
+        except Exception:
+            stats["distinctRegions"] = 0
 
         # Distinct SKUs
-        cur = await conn.execute("SELECT COUNT(*) FROM vm_sku_catalog")
-        row = await cur.fetchone()
-        stats["distinctSkus"] = row[0] if row else 0
+        stats["distinctSkus"] = count_map.get("vm_sku_catalog", 0)
 
         # Latest job per dataset
         cur = await conn.execute(

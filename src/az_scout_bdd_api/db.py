@@ -99,7 +99,7 @@ async def ensure_pool() -> psycopg_pool.AsyncConnectionPool:
         # so the check callback is less critical but still useful.
         pool: psycopg_pool.AsyncConnectionPool = psycopg_pool.AsyncNullConnectionPool(
             conninfo=conninfo,
-            max_size=5,
+            max_size=20,
             open=False,
             kwargs=lambda: {"password": _get_token(cfg)},
             reconnect_timeout=30,
@@ -109,8 +109,8 @@ async def ensure_pool() -> psycopg_pool.AsyncConnectionPool:
     else:
         pool = psycopg_pool.AsyncConnectionPool(
             conninfo=conninfo,
-            min_size=1,
-            max_size=5,
+            min_size=3,
+            max_size=20,
             open=False,
             reconnect_timeout=30,
             check=_check_conn,
